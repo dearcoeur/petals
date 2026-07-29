@@ -1,0 +1,164 @@
+// Pulls every row from the Notion database and writes it out as
+// data/media.json, grouped by section, in the shape js/app.js expects:
+//   { movies:[{id,title,creator,photo}], series:[...], ... }
+//
+// Requires two env vars (set as GitHub Actions secrets):
+//   NOTION_TOKEN        - the integration's "Internal Integration Secret"
+//   NOTION_DATABASE_ID  - the database's id (from its URL)
+//
+// Matches your actual database columns:
+//   (Title)      - Notion's built-in title column, e.g. "A Lady for All Seasons"
+//   Type         (Select)  - Book, Movie, Series, Anime, Cartoon, Music, Poem, Manga
+//   Author       (Text)    - author / director / studio / artist, whatever fits the Type
+//   Cover Image  (URL)     - optional cover image
+//   Order        (Number)  - optional, lower shows first (not required — only used if present)
+//
+// "Book" rows are skipped here: the site's Library already has its own separate
+// book catalog (js/books.js), so this script only handles the 7 media sections.
+//
+// Node 18+ has fetch built in, so this needs no npm dependencies.
+
+const NOTION_TOKEN = process.env.NOTION_TOKEN;
+const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID;
+const NOTION_VERSION = '2022-06-28';
+
+if(!NOTION_TOKEN || !NOTION_DATABASE_ID){
+  console.error('Missing NOTION_TOKEN or NOTION_DATABASE_ID environment variables.');
+  process.exit(1);
+}
+
+// Notion "Type" select label -> the route key js/app.js's MEDIA_SECTIONS uses.
+const TYPE_TO_ROUTE = {
+  'Movie': 'movies',
+  'Series': 'series',
+  'Anime': 'animes',
+  'Cartoon': 'cartoons',
+  'Music': 'music',
+  'Poem': 'poems',
+  'Manga': 'mangas',
+  // 'Book' intentionally omitted — handled by js/books.js instead.
+};
+
+async function queryDatabase(){
+  let results = [];
+  let cursor = undefined;
+  do{
+    const res = await fetch(`https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}/query`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${NOTION_TOKEN}`,
+        'Notion-Version': NOTION_VERSION,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(cursor ? { start_cursor: cursor } : {}),
+    });
+    if(!res.ok){
+      const body = await res.text();
+      throw new Error(`Notion API error ${res.status}: ${body}`);
+    }
+    const json = await res.json();
+    results = results.concat(json.results);
+    cursor = json.has_more ? json.next_cursor : undefined;
+  } while(cursor);
+  return results;
+}
+
+function plainTextFromRichText(richTextArr){
+  if(!Array.isArray(richTextArr)) return '';
+  return richTextArr.map(t => t.plain_text || '').join('').trim();
+}
+
+function extractTitle(props){
+  const titleProp = Object.values(props).find(p => p.type === 'title');
+  return titleProp ? plainTextFromRichText(titleProp.title) : '';
+}
+
+function extractCreator(props){
+  const p = props['Author'];
+  if(!p) return '';
+  if(p.type === 'rich_text') return plainTextFromRichText(p.rich_text);
+  if(p.type === 'select') return p.select?.name || '';
+  if(p.type === 'title') return plainTextFromRichText(p.title);
+  return '';
+}
+
+function extractType(props){
+  const p = props['Type'];
+  if(!p) return null;
+  if(p.type === 'select') return p.select?.name || null;
+  if(p.type === 'rich_text') return plainTextFromRichText(p.rich_text) || null;
+  return null;
+}
+
+function extractCover(props, page){
+  const p = props['Cover Image'];
+  if(p){
+    if(p.type === 'url' && p.url) return p.url;
+    if(p.type === 'files' && p.files?.length){
+      const f = p.files[0];
+      return f.type === 'external' ? f.external.url : f.file.url;
+    }
+  }
+  // fall back to the page's own cover image, if set in Notion's UI
+  if(page.cover){
+    return page.cover.type === 'external' ? page.cover.external.url : page.cover.file.url;
+  }
+  return null;
+}
+
+function extractOrder(props){
+  const p = props['Order'];
+  if(p && p.type === 'number' && typeof p.number === 'number') return p.number;
+  return null;
+}
+
+async function main(){
+  const pages = await queryDatabase();
+  const grouped = { movies: [], series: [], animes: [], cartoons: [], music: [], poems: [], mangas: [] };
+
+  for(const page of pages){
+    const props = page.properties;
+    const title = extractTitle(props);
+    if(!title) continue; // skip empty/placeholder rows
+
+    const typeLabel = extractType(props);
+    if(typeLabel === 'Book') continue; // handled by js/books.js instead
+    const route = typeLabel ? TYPE_TO_ROUTE[typeLabel] : null;
+    if(!route){
+      console.warn(`Skipping "${title}": no recognized Type (got ${JSON.stringify(typeLabel)}).`);
+      continue;
+    }
+
+    grouped[route].push({
+      id: page.id,
+      title,
+      creator: extractCreator(props),
+      photo: extractCover(props, page),
+      _order: extractOrder(props),
+    });
+  }
+
+  // sort by Order when present (items without it sink to the bottom, in their
+  // original Notion order among themselves)
+  for(const route of Object.keys(grouped)){
+    grouped[route].sort((a, b) => {
+      if(a._order === null && b._order === null) return 0;
+      if(a._order === null) return 1;
+      if(b._order === null) return -1;
+      return a._order - b._order;
+    });
+    grouped[route] = grouped[route].map(({ _order, ...rest }) => rest);
+  }
+
+  const fs = await import('node:fs/promises');
+  await fs.mkdir('data', { recursive: true });
+  await fs.writeFile('data/media.json', JSON.stringify(grouped, null, 2) + '\n');
+
+  const counts = Object.entries(grouped).map(([k, v]) => `${k}: ${v.length}`).join(', ');
+  console.log(`Wrote data/media.json — ${counts}`);
+}
+
+main().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
