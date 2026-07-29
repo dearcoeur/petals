@@ -1,18 +1,20 @@
 // Pulls every row from the Notion database and writes it out as
-// data/media.json, grouped by category, in the shape js/app.js expects:
+// data/media.json, grouped by section, in the shape js/app.js expects:
 //   { movies:[{id,title,creator,photo}], series:[...], ... }
 //
 // Requires two env vars (set as GitHub Actions secrets):
 //   NOTION_TOKEN        - the integration's "Internal Integration Secret"
 //   NOTION_DATABASE_ID  - the database's id (from its URL)
 //
-// Expected Notion database columns (see README-notion.md for the full guide):
-//   Name      (Title)               - required, Notion's built-in title column
-//   Category  (Select)               - one of: Movies, Series, Animes, Cartoons,
-//                                      Music, Poems, Manga
-//   Creator   (Text)                 - director / artist / studio / author
-//   Cover     (URL)  OR  (Files)     - optional cover image
-//   Order     (Number)               - optional, lower shows first
+// Matches your actual database columns:
+//   (Title)      - Notion's built-in title column, e.g. "A Lady for All Seasons"
+//   Type         (Select)  - Book, Movie, Series, Anime, Cartoon, Music, Poem, Manga
+//   Author       (Text)    - author / director / studio / artist, whatever fits the Type
+//   Cover Image  (URL)     - optional cover image
+//   Order        (Number)  - optional, lower shows first (not required — only used if present)
+//
+// "Book" rows are skipped here: the site's Library already has its own separate
+// book catalog (js/books.js), so this script only handles the 7 media sections.
 //
 // Node 18+ has fetch built in, so this needs no npm dependencies.
 
@@ -25,18 +27,16 @@ if(!NOTION_TOKEN || !NOTION_DATABASE_ID){
   process.exit(1);
 }
 
-// Notion "Category" select label -> the route key js/app.js's MEDIA_SECTIONS uses.
-const CATEGORY_TO_ROUTE = {
-  'Movies': 'movies',
+// Notion "Type" select label -> the route key js/app.js's MEDIA_SECTIONS uses.
+const TYPE_TO_ROUTE = {
+  'Movie': 'movies',
   'Series': 'series',
-  'Animes': 'animes',
   'Anime': 'animes',
-  'Cartoons': 'cartoons',
+  'Cartoon': 'cartoons',
   'Music': 'music',
-  'Poems': 'poems',
-  'Poetry': 'poems',
+  'Poem': 'poems',
   'Manga': 'mangas',
-  'Mangas': 'mangas',
+  // 'Book' intentionally omitted — handled by js/books.js instead.
 };
 
 async function queryDatabase(){
@@ -74,15 +74,16 @@ function extractTitle(props){
 }
 
 function extractCreator(props){
-  const p = props['Creator'];
+  const p = props['Author'];
   if(!p) return '';
   if(p.type === 'rich_text') return plainTextFromRichText(p.rich_text);
   if(p.type === 'select') return p.select?.name || '';
+  if(p.type === 'title') return plainTextFromRichText(p.title);
   return '';
 }
 
-function extractCategory(props){
-  const p = props['Category'];
+function extractType(props){
+  const p = props['Type'];
   if(!p) return null;
   if(p.type === 'select') return p.select?.name || null;
   if(p.type === 'rich_text') return plainTextFromRichText(p.rich_text) || null;
@@ -90,7 +91,7 @@ function extractCategory(props){
 }
 
 function extractCover(props, page){
-  const p = props['Cover'];
+  const p = props['Cover Image'];
   if(p){
     if(p.type === 'url' && p.url) return p.url;
     if(p.type === 'files' && p.files?.length){
@@ -120,10 +121,11 @@ async function main(){
     const title = extractTitle(props);
     if(!title) continue; // skip empty/placeholder rows
 
-    const categoryLabel = extractCategory(props);
-    const route = categoryLabel ? CATEGORY_TO_ROUTE[categoryLabel] : null;
+    const typeLabel = extractType(props);
+    if(typeLabel === 'Book') continue; // handled by js/books.js instead
+    const route = typeLabel ? TYPE_TO_ROUTE[typeLabel] : null;
     if(!route){
-      console.warn(`Skipping "${title}": no recognized Category (got ${JSON.stringify(categoryLabel)}).`);
+      console.warn(`Skipping "${title}": no recognized Type (got ${JSON.stringify(typeLabel)}).`);
       continue;
     }
 
@@ -160,3 +162,4 @@ main().catch(err => {
   console.error(err);
   process.exit(1);
 });
+
